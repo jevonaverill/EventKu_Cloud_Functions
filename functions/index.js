@@ -9,6 +9,10 @@
 const functions = require('firebase-functions');
 const nodemailer = require('nodemailer');
 const admin = require('firebase-admin');
+const request = require('request-promise');
+
+const gcs = require('@google-cloud/storage')()
+const spawn = require('child-process-promise').spawn
 
 // the required modules for our project have been imported and initialized
 admin.initializeApp(functions.config().firebase);
@@ -29,6 +33,43 @@ const mailTransport = nodemailer.createTransport(
 // Your company name to include in the emails
 // TODO: Change this to your app or company name to customize the email sent.
 const APP_NAME = 'EventKu';
+
+// Cloud Storage Triggers
+exports.generateThumbnail = functions.storage.object().onChange(event => {
+  const object = event.data
+  const filePath = object.name
+  const fileName = filePath.split('/').pop()
+  const fileBucket = object.bucket
+  const bucket = gcs.bucket(fileBucket)
+  const tempFilePath = `/tmp/${fileName}`
+
+  if (fileName.startsWith('thumb_')) {
+    console.log("Already a thumbnail")
+    return
+  }
+
+  // if (!object.contentType.startsWith('/image/')) {
+  // console.log('This is not an image')
+  // return
+  // }
+
+  // if (object.resourceState === 'not_exists') {
+  //   console.log("This is a deletion event");
+  //   return
+  // }
+
+  return bucket.file(filePath).download({
+    destination: tempFilePath
+  }).then(() => {
+    return spawn('convert', [tempFilePath, '-thumbnail', '200x200>', tempFilePath])
+  }).then(() => {
+    const thumbFilePath = filePath.replace(/(\/)?([^\/]*)$/, '$1thumb_$2')
+
+    return bucket.upload(tempFilePath, {
+      destination: thumbFilePath
+    })
+  })
+})
 
 // Push Notification User
 exports.pushNotificationUser = functions.database.ref('/users/{userId}')
@@ -119,6 +160,23 @@ exports.sendEmail = functions.database.ref('/users/{userId}')
   });
 // [END sendWelcomeEmail]
 
+// [START sendEmailEventVerified]
+/**
+ * Sends an email to event that have been verified.
+ */
+// [START onCreateTrigger]
+exports.sendEmailEventVerified = functions.database.ref('/events/{eventId}')
+  .onCreate(event => {
+    // [END onCreateTrigger]
+    // [START eventAttributes]
+    console.log("id oii");
+    console.log(event.params.eventId);
+    const eventSnapshot = event.data; // The Firebase user.
+    // Exit when the data is deleted.
+    return sendEmailEventVerifiedTest(eventSnapshot)
+  });
+// [END sendWelcomeEmail]
+
 // // [START sendByeEmail]
 // /**
 //  * Send an account deleted email confirmation to users who delete their accounts.
@@ -161,6 +219,28 @@ function sendWelcomeEmail(email, displayName) {
   });
 }
 
+function sendEmailEventVerifiedTest(event) {
+  const mailOptions = {
+    from: `${APP_NAME} <noreply@eventku.com>`,
+    to: 'jevonave@gmail.com'
+  };
+
+  console.log(event);
+  console.log(mailOptions);
+
+  const eventName = event.child('eventName').val();
+
+  // The user subscribed to the newsletter.
+  mailOptions.subject = `${APP_NAME} - Verified`;
+  mailOptions.html = `Your event: ${eventName} has been verified.<br/><br/>
+  Thanks!<br/>
+  EventKu Support Team<br/><br/>
+  Google Firebase Appfest Hackathon Indonesia. Ayana Midplaza, Jakarta, Indonesia`;
+  return mailTransport.sendMail(mailOptions).then(() => {
+    console.log('New welcome email sent to:', email);
+  });
+}
+
 // Sends a goodbye email to the given user.
 function sendGoodbyeEmail(email, displayName) {
   const mailOptions = {
@@ -189,3 +269,53 @@ exports.createNewUser = functions.auth.user().onCreate(event => {
     photoURL: event.data.photoURL
   })
 });
+
+// Shorten URL
+exports.shortenUrl = functions.database.ref('/events/{eventId}').onCreate(event => {
+  console.log('1')
+  console.log(event);
+  return createShortenerPromise(event);
+});
+
+// URL to the Google URL Shortener API.
+// AIzaSyDbGrJ04pL8w8Cr9Vb2CZnQ_uTAg0yIffM
+function createShortenerRequest(sourceUrl) {
+  console.log('4')
+  return {
+    method: 'POST',
+    uri: `https://www.googleapis.com/urlshortener/v1/url?key=AIzaSyDbGrJ04pL8w8Cr9Vb2CZnQ_uTAg0yIffM`,
+    body: {
+      longUrl: sourceUrl
+    },
+    json: true,
+    resolveWithFullResponse: true
+  };
+}
+
+function createShortenerPromise(snapshot) {
+  console.log('5')
+  const originalUrl = snapshot.data.child("backgroundImageURL").val();
+  const eventId = snapshot.params.eventId;
+  console.log('snap')
+  console.log(snapshot)
+  console.log(eventId)
+  return request(createShortenerRequest(originalUrl)).then(response => {
+    console.log('6')
+    if (response.statusCode === 200) {
+      console.log('7')
+      return response.body.id;
+    }
+    throw response.body;
+  }).then(shortUrl => {
+    console.log('8')
+    return admin.database().ref(`/events/${eventId}`).set({
+      eventName: snapshot.data.child("eventName").val(),
+      eventDescription: snapshot.data.child("eventDescription").val(),
+      eventCategory: snapshot.data.child("eventName").val(),
+      eventLocation: snapshot.data.child("eventCategory").val(),
+      eventDate: new Date(snapshot.data.child("eventDate").val()).toISOString(),
+      isVerified: false,
+      backgroundImageURL: shortUrl
+    });
+  });
+}
